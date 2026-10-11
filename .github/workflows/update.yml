@@ -15,14 +15,16 @@ jobs:
     container:
       image: archlinux:base-devel
     steps:
+      - name: Install git and essential tools
+        run: |
+          pacman -Sy --noconfirm git openssh curl jq pacman-contrib
+
       - name: Checkout GitHub repository
         uses: actions/checkout@v4
 
       - name: Check upstream latest version
         id: check
         run: |
-          pacman -Sy --noconfirm curl jq git pacman-contrib openssh
-
           # 从上游 GitHub API 获取最新 Release 的 tag (去掉开头的 v)
           UPSTREAM_VER=$(curl -s https://api.github.com/repos/Javis603/token-monitor/releases/latest | jq -r '.tag_name | ltrimstr("v")')
           if [[ -z "$UPSTREAM_VER" || "$UPSTREAM_VER" == "null" ]]; then
