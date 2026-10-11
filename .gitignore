@@ -1,0 +1,10 @@
+# Upstream downloaded binary
+*.AppImage
+
+# Built Arch package
+*.pkg.tar.zst
+
+# makepkg temporary build directories
+src/
+pkg/
+squashfs-root/

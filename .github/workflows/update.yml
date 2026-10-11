@@ -1,0 +1,99 @@
+name: Auto Update AUR Package
+
+on:
+  schedule:
+    # 每天 UTC 00:00 (北京时间早上 08:00) 自动运行一次
+    - cron: '0 0 * * *'
+  workflow_dispatch: # 允许在 GitHub 网页上随时手动点击触发
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v4
+
+      - name: Check upstream latest version
+        id: check
+        run: |
+          pacman -Sy --noconfirm curl jq git pacman-contrib openssh
+
+          # 从上游 GitHub API 获取最新 Release 的 tag (去掉开头的 v)
+          UPSTREAM_VER=$(curl -s https://api.github.com/repos/Javis603/token-monitor/releases/latest | jq -r '.tag_name | ltrimstr("v")')
+          if [[ -z "$UPSTREAM_VER" || "$UPSTREAM_VER" == "null" ]]; then
+            echo "Failed to fetch upstream version"
+            exit 1
+          fi
+
+          # 读取当前 PKGBUILD 中的 pkgver
+          CURRENT_VER=$(grep -oP '^pkgver=\K.*' PKGBUILD)
+
+          echo "Upstream version: $UPSTREAM_VER"
+          echo "Current version:  $CURRENT_VER"
+
+          if [[ "$UPSTREAM_VER" != "$CURRENT_VER" ]]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "new_ver=$UPSTREAM_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update PKGBUILD and .SRCINFO
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          NEW_VER="${{ steps.check.outputs.new_ver }}"
+
+          # makepkg 和 updpkgsums 禁止以 root 运行，需创建临时打包用户 builder
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+          su builder -c "
+            cd '$GITHUB_WORKSPACE'
+            sed -i 's/^pkgver=.*/pkgver=${NEW_VER}/' PKGBUILD
+            sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+            updpkgsums
+            makepkg --printsrcinfo > .SRCINFO
+          "
+
+      - name: Commit update back to GitHub repository
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "${{ vars.AUR_USERNAME || 'github-actions[bot]' }}"
+          git config user.email "${{ vars.AUR_EMAIL || 'github-actions[bot]@users.noreply.github.com' }}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: token-monitor-bin ${{ steps.check.outputs.new_ver }}-1"
+          git push
+
+      - name: Push to AUR
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p /root/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/aur
+          chmod 600 /root/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> /root/.ssh/known_hosts
+
+          cat <<EOF > /root/.ssh/config
+          Host aur.archlinux.org
+            User aur
+            IdentityFile /root/.ssh/aur
+            StrictHostKeyChecking accept-new
+          EOF
+
+          # 克隆 AUR 仓库到临时目录，仅复制 PKGBUILD 和 .SRCINFO（避免把 .github 目录推到 AUR）
+          git clone ssh://aur@aur.archlinux.org/token-monitor-bin.git /tmp/aur-repo
+          cp PKGBUILD .SRCINFO /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git config user.name "${{ vars.AUR_USERNAME }}"
+          git config user.email "${{ vars.AUR_EMAIL }}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: token-monitor-bin ${{ steps.check.outputs.new_ver }}-1"
+          git push origin master
