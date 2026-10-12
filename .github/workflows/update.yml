@@ -2,8 +2,8 @@ name: Auto Update AUR Package
 
 on:
   schedule:
-    # 每天 UTC 00:00 (北京时间早上 08:00) 自动运行一次
-    - cron: '0 0 * * *'
+    # 每 4 小时在整点后 20 分触发一次（错开正点高峰，避免 Actions 调度延迟或丢事件）
+    - cron: '20 */4 * * *'
   workflow_dispatch: # 允许在 GitHub 网页上随时手动点击触发
 
 permissions:
