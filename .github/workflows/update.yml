@@ -24,12 +24,43 @@ jobs:
 
       - name: Check upstream latest version
         id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          # 从上游 GitHub API 获取最新 Release 的 tag (去掉开头的 v)
-          UPSTREAM_VER=$(curl -s https://api.github.com/repos/Javis603/token-monitor/releases/latest | jq -r '.tag_name | ltrimstr("v")')
-          if [[ -z "$UPSTREAM_VER" || "$UPSTREAM_VER" == "null" ]]; then
-            echo "Failed to fetch upstream version"
-            exit 1
+          API_URL="https://api.github.com/repos/Javis603/token-monitor/releases/latest"
+          UPSTREAM_VER=""
+          MAX_RETRIES=3
+
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Fetching upstream latest release (attempt $i/$MAX_RETRIES)..."
+            API_RES=$(curl -sSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "$API_URL" 2>/dev/null || true)
+
+            # 安全提取 tag_name，避免非 JSON 或 null 输入导致 jq 崩溃
+            TAG_NAME=$(echo "$API_RES" | jq -r '.tag_name // empty' 2>/dev/null || true)
+
+            if [[ -n "$TAG_NAME" && "$TAG_NAME" != "null" ]]; then
+              UPSTREAM_VER="${TAG_NAME#v}"
+              break
+            fi
+
+            API_MSG=$(echo "$API_RES" | jq -r '.message // empty' 2>/dev/null || true)
+            if [[ -n "$API_MSG" ]]; then
+              echo "GitHub API message: $API_MSG"
+            fi
+
+            if [[ $i -lt $MAX_RETRIES ]]; then
+              echo "Retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+          if [[ -z "$UPSTREAM_VER" ]]; then
+            echo "::warning::Failed to fetch upstream version after $MAX_RETRIES attempts (API error / rate limited)."
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
           # 读取当前 PKGBUILD 中的 pkgver
