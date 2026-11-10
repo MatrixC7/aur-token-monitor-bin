@@ -9,120 +9,125 @@ on:
 permissions:
   contents: write
 
-# 同一个 workflow 同时只跑一个实例：避免两次运行各自 bump 版本、互相覆盖后再推 AUR
-concurrency:
-  group: ${{ github.workflow }}
-  cancel-in-progress: false
-
-env:
-  UPSTREAM_REPO: Javis603/token-monitor
-  PKGBASE: token-monitor-bin
-
 jobs:
   update:
-    name: Check upstream and publish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     container:
-      # Debian 13 "trixie"（当前 stable），按 digest 钉死。
-      #
-      # 这是本次改写的核心：旧 workflow 用 archlinux:base-devel 这种滚动镜像，
-      # 镜像里已装好的库和 `pacman -Sy` 现拉的仓库索引天然对不上（Arch 只支持
-      # 全量 -Syu，不允许部分升级），于是要么报 "installing X breaks dependency Y"，
-      # 要么就得像旧版那样手动 pacman -U 把 openssl 锁在某个旧版本——而那个旧包
-      # 迟早又会和更新的 glibc/icu 冲突。这是个无法自愈的死循环。
-      #
-      # Debian stable 的仓库在一个发行版生命周期内始终自洽：包只会单调地做
-      # 安全更新，不会出现依赖图断裂。再叠上 digest 固定，工具链就完全冻结了。
-      #
-      # 需要升级基础镜像时，见 .github/ci/README.md；也可以在仓库
-      # Settings → Variables 里设 BUILD_IMAGE 直接覆盖，无需改这个文件。
-      image: ${{ vars.BUILD_IMAGE || 'debian:13-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2' }}
-    defaults:
-      run:
-        shell: bash
-
+      image: archlinux:base-devel
     steps:
-      - name: Install toolchain
-        env:
-          DEBIAN_FRONTEND: noninteractive
+      - name: Install git and essential tools
         run: |
-          set -euo pipefail
-          # 只装真正需要的几个包，全部来自 Debian stable 仓库，不需要任何第三方源。
-          # libstdc++6 是给 Actions 挂进来的 node 运行时用的，省得 slim 镜像里缺库。
-          apt-get update
-          apt-get install -y --no-install-recommends \
-            ca-certificates curl git jq openssh-client libstdc++6
-          rm -rf /var/lib/apt/lists/*
-          # 把实际装到的版本打进日志，将来出问题能直接对照
-          dpkg-query -W -f='${Package} ${Version}\n' \
-            ca-certificates curl git jq openssh-client libstdc++6 | sort
+          pacman -U --noconfirm https://archive.archlinux.org/packages/o/openssl/openssl-3.6.5-1-x86_64.pkg.tar.zst
+          pacman -Sy --noconfirm git openssh curl jq pacman-contrib
 
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v7
 
-      - name: Check upstream release
-        id: upstream
+      - name: Check upstream latest version
+        id: check
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash .github/ci/resolve-upstream.sh
-
-      - name: Update PKGBUILD and .SRCINFO
-        if: steps.upstream.outputs.has_update == 'true'
-        env:
-          NEW_VER: ${{ steps.upstream.outputs.new_ver }}
-          ASSET_URL: ${{ steps.upstream.outputs.asset_url }}
         run: |
-          set -euo pipefail
-          work=$(mktemp -d)
-          trap 'rm -rf "$work"' EXIT
+          API_URL="https://api.github.com/repos/Javis603/token-monitor/releases/latest"
+          UPSTREAM_VER=""
+          MAX_RETRIES=3
 
-          echo "downloading ${ASSET_URL}"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
-               --connect-timeout 20 -o "$work/app.AppImage" "$ASSET_URL"
+          for i in $(seq 1 $MAX_RETRIES); do
+            echo "Fetching upstream latest release (attempt $i/$MAX_RETRIES)..."
+            API_RES=$(curl -sSL \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "$API_URL" 2>/dev/null || true)
 
-          # 上游返回一个 HTML 错误页、或者传到一半的残包，都不该被当成新版本记进去
-          size=$(stat -c %s "$work/app.AppImage")
-          (( size > 1048576 )) || { echo "::error::asset is only ${size} bytes"; exit 1; }
-          if [[ $(head -c 4 "$work/app.AppImage") != $'\x7fELF' ]]; then
-            echo "::error::asset is not an ELF/AppImage"; exit 1
+            # 安全提取 tag_name，避免非 JSON 或 null 输入导致 jq 崩溃
+            TAG_NAME=$(echo "$API_RES" | jq -r '.tag_name // empty' 2>/dev/null || true)
+
+            if [[ -n "$TAG_NAME" && "$TAG_NAME" != "null" ]]; then
+              UPSTREAM_VER="${TAG_NAME#v}"
+              break
+            fi
+
+            API_MSG=$(echo "$API_RES" | jq -r '.message // empty' 2>/dev/null || true)
+            if [[ -n "$API_MSG" ]]; then
+              echo "GitHub API message: $API_MSG"
+            fi
+
+            if [[ $i -lt $MAX_RETRIES ]]; then
+              echo "Retrying in 5 seconds..."
+              sleep 5
+            fi
+          done
+
+          if [[ -z "$UPSTREAM_VER" ]]; then
+            echo "::warning::Failed to fetch upstream version after $MAX_RETRIES attempts (API error / rate limited)."
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
 
-          sha=$(sha256sum "$work/app.AppImage" | cut -d' ' -f1)
-          echo "sha256: ${sha}"
+          # 读取当前 PKGBUILD 中的 pkgver
+          CURRENT_VER=$(grep -oP '^pkgver=\K.*' PKGBUILD)
 
-          bash .github/ci/bump-pkgbuild.sh "$NEW_VER" "$sha" PKGBUILD
+          echo "Upstream version: $UPSTREAM_VER"
+          echo "Current version:  $CURRENT_VER"
 
-          # 先写临时文件再原子替换，脚本中途失败不会留下半截 .SRCINFO
-          bash .github/ci/gen-srcinfo.sh PKGBUILD > "$work/SRCINFO"
-          mv "$work/SRCINFO" .SRCINFO
+          if [[ "$UPSTREAM_VER" != "$CURRENT_VER" ]]; then
+            echo "has_update=true" >> "$GITHUB_OUTPUT"
+            echo "new_ver=$UPSTREAM_VER" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_update=false" >> "$GITHUB_OUTPUT"
+          fi
 
-          git --no-pager diff --stat
-
-      - name: Commit to GitHub repository
-        if: steps.upstream.outputs.has_update == 'true'
-        env:
-          NEW_VER: ${{ steps.upstream.outputs.new_ver }}
+      - name: Update PKGBUILD and .SRCINFO
+        if: steps.check.outputs.has_update == 'true'
         run: |
-          set -euo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
-          # 用仓库级配置而不是 --global：不依赖 $HOME 可写
+          NEW_VER="${{ steps.check.outputs.new_ver }}"
+
+          # makepkg 和 updpkgsums 禁止以 root 运行，需创建临时打包用户 builder
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+          su builder -c "
+            cd '$GITHUB_WORKSPACE'
+            sed -i 's/^pkgver=.*/pkgver=${NEW_VER}/' PKGBUILD
+            sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
+            updpkgsums
+            makepkg --printsrcinfo > .SRCINFO
+          "
+
+      - name: Commit update back to GitHub repository
+        if: steps.check.outputs.has_update == 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "${{ vars.AUR_USERNAME || 'github-actions[bot]' }}"
           git config user.email "${{ vars.AUR_EMAIL || 'github-actions[bot]@users.noreply.github.com' }}"
           git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "metadata unchanged, nothing to commit"
-            exit 0
-          fi
-          git commit -m "upgpkg: ${PKGBASE} ${NEW_VER}-1"
+          git commit -m "upgpkg: token-monitor-bin ${{ steps.check.outputs.new_ver }}-1"
           git push
 
       - name: Push to AUR
-        if: steps.upstream.outputs.has_update == 'true'
+        if: steps.check.outputs.has_update == 'true'
         env:
-          NEW_VER: ${{ steps.upstream.outputs.new_ver }}
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          AUR_HOST_KEY: ${{ vars.AUR_HOST_KEY }}
-          AUR_USERNAME: ${{ vars.AUR_USERNAME }}
-          AUR_EMAIL: ${{ vars.AUR_EMAIL }}
-        run: bash .github/ci/push-aur.sh
+        run: |
+          mkdir -p /root/.ssh
+          echo "$AUR_SSH_PRIVATE_KEY" > /root/.ssh/aur
+          chmod 600 /root/.ssh/aur
+          ssh-keyscan -H aur.archlinux.org >> /root/.ssh/known_hosts
+
+          cat <<EOF > /root/.ssh/config
+          Host aur.archlinux.org
+            User aur
+            IdentityFile /root/.ssh/aur
+            StrictHostKeyChecking accept-new
+          EOF
+
+          # 克隆 AUR 仓库到临时目录，仅复制 PKGBUILD 和 .SRCINFO（避免把 .github 目录推到 AUR）
+          git clone ssh://aur@aur.archlinux.org/token-monitor-bin.git /tmp/aur-repo
+          cp PKGBUILD .SRCINFO /tmp/aur-repo/
+          cd /tmp/aur-repo
+          git config user.name "${{ vars.AUR_USERNAME }}"
+          git config user.email "${{ vars.AUR_EMAIL }}"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: token-monitor-bin ${{ steps.check.outputs.new_ver }}-1"
+          git push origin master
