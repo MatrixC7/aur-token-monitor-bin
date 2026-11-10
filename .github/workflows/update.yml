@@ -17,8 +17,19 @@ jobs:
     steps:
       - name: Install git and essential tools
         run: |
-          pacman -U --noconfirm https://archive.archlinux.org/packages/o/openssl/openssl-3.6.5-1-x86_64.pkg.tar.zst
-          pacman -Sy --noconfirm git openssh curl jq pacman-contrib
+          # Arch 不支持部分升级。镜像里预装的是发布当天的旧库，而 `pacman -Sy`
+          # 只刷新仓库索引、不升级已装的包，「新索引 + 旧库」必然算出
+          # "installing X breaks dependency Y" —— 之前就是死在这里。
+          #
+          # 正确做法是全量升级（-Syu），让索引和已装包一起走。先单独升 keyring：
+          # 镜像放久了会因签名密钥轮转而报 "invalid or corrupted package
+          # (PGP signature)"，换钥匙要在升级别的包之前。
+          #
+          # 也不要再手工 `pacman -U` 把单个包钉回旧版本：那只是把冲突往后拖，
+          # 旧包迟早和更新的 glibc/icu/curl 再撞一次。依赖问题必须在升级层面
+          # 解决，不能靠给单个包打补丁。
+          pacman -Syu --noconfirm --needed archlinux-keyring
+          pacman -Syu --noconfirm --needed git openssh curl jq pacman-contrib
 
       - name: Checkout GitHub repository
         uses: actions/checkout@v7
@@ -79,21 +90,34 @@ jobs:
 
       - name: Update PKGBUILD and .SRCINFO
         if: steps.check.outputs.has_update == 'true'
+        env:
+          # 用 env 传值，而不是把 ${{ }} 写进脚本正文：GitHub 的表达式替换是在
+          # bash 解析之前做纯文本替换的，版本号里如果带引号或 $( )，就会变成
+          # 真正的代码执行。走环境变量则只是数据。
+          NEW_VER: ${{ steps.check.outputs.new_ver }}
         run: |
-          NEW_VER="${{ steps.check.outputs.new_ver }}"
+          # Arch 的 pkgver 只允许字母数字和 . _ +。这条同时挡住会破坏下面 sed
+          # 替换的 & 和 |，避免把畸形版本号写进 PKGBUILD 和 AUR。
+          if [[ ! $NEW_VER =~ ^[0-9A-Za-z][0-9A-Za-z._+]*$ ]]; then
+            echo "::error::upstream version '$NEW_VER' is not a valid Arch pkgver"
+            exit 1
+          fi
 
           # makepkg 和 updpkgsums 禁止以 root 运行，需创建临时打包用户 builder
           useradd -m builder
-          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
-          su builder -c "
-            cd '$GITHUB_WORKSPACE'
-            sed -i 's/^pkgver=.*/pkgver=${NEW_VER}/' PKGBUILD
-            sed -i 's/^pkgrel=.*/pkgrel=1/' PKGBUILD
-            updpkgsums
-            makepkg --printsrcinfo > .SRCINFO
-          "
+          # 用 runuser 而不是 su -c "拼好的字符串"：root 切换用户本来就不需要
+          # sudo（原来的 sudoers 授权没人用），也不会把变量值混进命令文本。
+          runuser -u builder -- env \
+            NEW_VER="$NEW_VER" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            bash -euo pipefail -c '
+              cd "$GITHUB_WORKSPACE"
+              sed -i "s|^pkgver=.*|pkgver=${NEW_VER}|" PKGBUILD
+              sed -i "s|^pkgrel=.*|pkgrel=1|" PKGBUILD
+              updpkgsums
+              makepkg --printsrcinfo > .SRCINFO
+            '
 
       - name: Commit update back to GitHub repository
         if: steps.check.outputs.has_update == 'true'
