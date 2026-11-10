@@ -1,0 +1,42 @@
+name: Validate packaging metadata
+
+# 轻量守卫，不碰 AUR、不联网：只保证 .SRCINFO 和 PKGBUILD 没有走偏。
+# 之所以需要它：update workflow 现在自己生成 .SRCINFO（Debian 上没有 makepkg），
+# 所以必须有一道检查确认「生成器的输出 == 仓库里提交的那份」。
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  srcinfo:
+    name: .SRCINFO matches PKGBUILD
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Regenerate and compare
+        run: |
+          set -euo pipefail
+          bash .github/ci/gen-srcinfo.sh PKGBUILD > "$RUNNER_TEMP/SRCINFO"
+          if ! diff -u .SRCINFO "$RUNNER_TEMP/SRCINFO"; then
+            echo "::error::.SRCINFO is out of date with PKGBUILD."
+            echo "::error::Fix locally with: bash .github/ci/gen-srcinfo.sh PKGBUILD > .SRCINFO"
+            exit 1
+          fi
+          echo "✅ .SRCINFO is in sync"
+
+      - name: Shell syntax check
+        run: |
+          set -euo pipefail
+          for f in .github/ci/*.sh; do
+            bash -n "$f"
+            echo "ok: $f"
+          done
