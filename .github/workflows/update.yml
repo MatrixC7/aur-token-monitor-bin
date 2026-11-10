@@ -17,6 +17,7 @@ jobs:
     steps:
       - name: Install git and essential tools
         run: |
+          pacman -U --noconfirm https://archive.archlinux.org/packages/o/openssl/openssl-3.6.5-1-x86_64.pkg.tar.zst
           pacman -Sy --noconfirm git openssh curl jq pacman-contrib
 
       - name: Checkout GitHub repository
